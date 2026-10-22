@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Editor
+.vscode/
+*.swp
+.DS_Store
+
+# LaTeX build products (the PDF itself is kept)
+docs/**/*.aux
+docs/**/*.log
+docs/**/*.out
+docs/**/*.toc
+docs/**/*.fls
+docs/**/*.fdb_latexmk
+docs/**/*.synctex.gz
+docs/**/*.bbl
+docs/**/*.blg
+docs/**/*.lof
+docs/**/*.lot
