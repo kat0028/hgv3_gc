@@ -31,8 +31,3 @@ dist/
 *.nav
 *.snm
 *.vrb
-
-# Compiled documents (rebuild with: cd docs && latexmk -pdf <name>.tex).
-# Only PDFs directly in docs/ are ignored, so reference papers in a
-# subfolder such as docs/references/ can still be committed.
-docs/*.pdf
