@@ -1,0 +1,1358 @@
+\documentclass[11pt]{report}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools,bm}
+\usepackage{booktabs,array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+\lstset{basicstyle=\ttfamily\small, columns=fullflexible, keepspaces=true,
+        frame=single, framerule=0.3pt, rulecolor=\color{black!30},
+        backgroundcolor=\color{black!3}, showstringspaces=false, language=Python,
+        aboveskip=8pt, belowskip=8pt}
+\numberwithin{equation}{chapter}
+\allowdisplaybreaks
+
+% unit vectors
+\newcommand{\uh}{\hat{\mathbf u}}
+\newcommand{\eh}{\hat{\mathbf e}}
+\newcommand{\nh}{\hat{\mathbf n}}
+\newcommand{\tth}{\hat{\mathbf t}}
+\newcommand{\gh}{\hat{\mathbf g}}
+\newcommand{\hh}{\hat{\mathbf h}}
+\newcommand{\zh}{\hat{\mathbf z}_E}
+\newcommand{\vb}[1]{\bm{#1}}
+\newcommand{\pd}[2]{\frac{\partial #1}{\partial #2}}
+\newcommand{\aL}{a_L}
+\newcommand{\aD}{a_D}
+\newcommand{\sdot}{\dot s}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Guidance and Control Models for the HL-20 Glide Vehicle\\[6pt]
+\large Point-mass dynamics, linearization, error-state models for LQR,\\
+and inner-loop attitude control (classical and NDI)}
+\author{hgv3\_gc project notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+%======================================================================
+\chapter*{How to read this document}
+\addcontentsline{toc}{chapter}{How to read this document}
+
+This document derives, in long form, the models used by the trajectory planner and the
+models needed to close the loop around the plan. The planner code is in
+\code{waypoint\_traj\_solver.py} and \code{hl20\_model.py}.
+
+The structure follows the pattern of Rajamani's
+\emph{Vehicle Dynamics and Control}: one chapter derives the vehicle model from first
+principles, and a later chapter goes back to the same nonlinear equations, substitutes
+error states, and works them into a state-space model for LQR.
+
+\begin{description}
+\item[\Cref{ch:notation}] Frames, states, constants and sign conventions.
+\item[\Cref{ch:eom}] The nonlinear point-mass equations of motion over a rotating,
+  oblate Earth, derived from Newton's second law. The result is exactly the model in
+  \code{hl20\_model.py}. The chapter ends with how it differs from the \code{hgv3}
+  simulator.
+\item[\Cref{ch:lin}] Jacobian linearization of those equations about a planned
+  trajectory, every partial derivative written out.
+\item[\Cref{ch:err}] The error-state (path-following) model: reference indexed by
+  ground-track arc length, error substitution, and linearization into
+  $\dot{\vb e} = A_e \vb e + B_e\,\delta\vb u$.
+\item[\Cref{ch:lqr}] Using that model for LQR gain design, and computing the matrices
+  numerically with CasADi.
+\item[\Cref{ch:inner}] The inner (attitude) loop for a 6-DOF simulation: rigid-body
+  rotational dynamics, wind-axis kinematics, classical gain-scheduled design, NDI and
+  INDI, all in long form.
+\item[\Cref{app:verify}] What was checked and how.
+\end{description}
+
+Equations are written component by component rather than in compact vector form, and
+intermediate steps are kept. Every equation in Chapters 2--4 and the kinematics in
+Chapter 6 were checked symbolically or numerically (\cref{app:verify}).
+
+%======================================================================
+\chapter{Notation, frames and conventions}\label{ch:notation}
+
+\section{Reference frames}
+
+\begin{description}
+\item[Inertial (ECI), $I$.] Non-rotating, origin at Earth's center. The \code{hgv3}
+  simulator integrates its equations of motion here.
+\item[Earth-fixed (ECEF), $E$.] Rotates with Earth at constant rate $\Omega$ about its
+  $z$ axis $\zh$. Positions and velocities in the planner are Earth-relative.
+\item[Local geocentric frame, $(\uh,\eh,\nh)$.] At the vehicle's position: $\uh$ points
+  radially up, $\eh$ east, $\nh$ north (perpendicular to $\uh$, toward the pole). It is
+  right-handed in the order $(\uh,\eh,\nh)$:
+  \[
+    \uh\times\eh=\nh,\qquad \eh\times\nh=\uh,\qquad \nh\times\uh=\eh .
+  \]
+  It is \emph{geocentric}: $\uh$ is along the radius vector, not the ellipsoid normal.
+\item[Velocity frame, $(\tth,\gh,\hh)$.] $\tth$ along the Earth-relative velocity,
+  $\gh$ perpendicular to it in the vertical plane on the ``up'' side, and $\hh$
+  horizontal and to the right of the velocity. Defined in \cref{sec:veldyn}.
+\item[Body and wind axes.] Used only in \cref{ch:inner}.
+\end{description}
+
+\section{States, inputs and parameters}
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Symbol & Meaning & Units & Code name \\
+\midrule
+$r$ & geocentric radius & m & \code{r} \\
+$\theta$ & longitude & rad & \code{lon} \\
+$\phi$ & geocentric latitude & rad & \code{lat} \\
+$V$ & Earth-relative speed & m/s & \code{V} \\
+$\gamma$ & flight-path angle, positive climbing & rad & \code{gam} \\
+$\psi$ & heading, clockwise from north & rad & \code{psi} \\
+$\alpha$ & angle of attack & rad & \code{alpha} \\
+$\sigma$ & bank angle, positive right wing down & rad & \code{sigma} \\
+$u_\alpha,\ u_\sigma$ & $\dot\alpha,\ \dot\sigma$ (planner controls only) & rad/s & \code{U} \\
+$h$ & geodetic altitude & m & \code{h} \\
+$\aL,\ \aD$ & lift and drag \emph{accelerations} (force per unit mass) & m/s$^2$ & \code{L}, \code{D} \\
+$\bar q$ & dynamic pressure $\tfrac12\rho V^2$ & Pa & \code{qbar} \\
+$M$ & Mach number $V/a_s(h)$ & -- & \code{mach} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The planner uses the 8-element state $[r,\theta,\phi,V,\gamma,\psi,\alpha,\sigma]$ with
+$[u_\alpha,u_\sigma]$ as controls, so that $\alpha$ and $\sigma$ are smooth and
+rate-limited. For the guidance problem in \cref{ch:lin,ch:err,ch:lqr}, $\alpha$ and
+$\sigma$ are treated directly as the inputs, because the 3-DOF simulator flies them
+exactly and a 6-DOF autopilot tracks them.
+
+\section{Constants}
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Symbol & Value & Meaning & Source (\code{hgv3.}) \\
+\midrule
+$\mu$ & $3.986004418\times10^{14}$ m$^3$/s$^2$ & gravitational parameter & \code{MU\_EARTH} \\
+$R_E$ & 6\,378\,137 m & equatorial radius & \code{R\_EARTH} \\
+$J_2$ & $1.08263\times10^{-3}$ & oblateness coefficient & \code{J2} \\
+$\Omega$ & $7.2921159\times10^{-5}$ rad/s & Earth rotation rate & \code{OMEGA\_EARTH} \\
+$g_0$ & 9.80665 m/s$^2$ & standard gravity & \code{G0} \\
+$a_{W}$ & 6\,378\,137 m & WGS84 semi-major axis & \code{WGS84\_A} \\
+$f_{W}$ & $1/298.257223563$ & WGS84 flattening & \code{WGS84\_F} \\
+$m$ & 8664 kg & HL-20 mass & airframe \\
+$S$ & 26.61 m$^2$ & reference area & airframe \\
+$\bar c$ & 8.61 m & reference length (pitch) & airframe \\
+$b$ & 4.23 m & reference span (roll, yaw) & airframe \\
+$I_{xx}, I_{yy}, I_{zz}$ & 10\,185, 45\,548, 48\,327 kg\,m$^2$ & principal inertias & airframe \\
+$I_{xz}$ & 0 (assumed in the data) & product of inertia & airframe \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Sign conventions}
+
+\begin{itemize}
+\item $\gamma>0$ is climbing; entry trajectories have $\gamma<0$.
+\item $\psi$ is measured clockwise from north: $\psi=\pi/2$ is due east.
+\item $\sigma>0$ (right wing down) tilts the lift vector to the right of the velocity and
+  turns the vehicle right, so $\dot\psi$ increases. This matches \code{hgv3}.
+\item Latitude in the planner is \emph{geocentric}. Waypoints and the simulator use
+  \emph{geodetic} latitude; conversions go through ECEF (\code{hgv3.lla\_to\_ecef}).
+\end{itemize}
+
+%======================================================================
+\chapter{Nonlinear point-mass equations of motion}\label{ch:eom}
+
+The vehicle is modeled as a point mass acted on by aerodynamic force and gravity. There
+is no thrust. Angle of attack $\alpha$ and bank $\sigma$ orient the aerodynamic force; their
+own dynamics are the subject of \cref{ch:inner}.
+
+\section{Newton's second law in the inertial frame}
+
+With $\vb r$ the position vector from Earth's center, Newton's law in ECI is
+\begin{equation}
+  \left.\frac{d^2\vb r}{dt^2}\right|_I = \vb a_{\text{aero}} + \vb g(\vb r),
+  \label{eq:newton}
+\end{equation}
+where $\vb a_{\text{aero}}$ is the aerodynamic force per unit mass and $\vb g$ is the
+gravitational acceleration. This is the form the \code{hgv3} simulator integrates, with
+RK4 on ECI position and velocity.
+
+\section{Moving to the rotating Earth frame}
+
+For any vector $\vb b$, the derivatives seen in the inertial and Earth frames are related
+by the transport theorem,
+\begin{equation}
+  \left.\frac{d\vb b}{dt}\right|_I = \left.\frac{d\vb b}{dt}\right|_E + \vb\Omega\times\vb b,
+  \qquad \vb\Omega = \Omega\,\zh .
+\end{equation}
+Applied to $\vb r$, it gives the inertial velocity in terms of the Earth-relative
+velocity $\vb v \equiv \left.d\vb r/dt\right|_E$:
+\begin{equation}
+  \left.\frac{d\vb r}{dt}\right|_I = \vb v + \vb\Omega\times\vb r .
+\end{equation}
+Applying it a second time, with $\Omega$ constant:
+\begin{align}
+  \left.\frac{d^2\vb r}{dt^2}\right|_I
+  &= \left.\frac{d}{dt}\big(\vb v + \vb\Omega\times\vb r\big)\right|_E
+     + \vb\Omega\times\big(\vb v + \vb\Omega\times\vb r\big) \notag\\
+  &= \left.\frac{d\vb v}{dt}\right|_E + \vb\Omega\times\vb v
+     + \vb\Omega\times\vb v + \vb\Omega\times(\vb\Omega\times\vb r) \notag\\
+  &= \left.\frac{d\vb v}{dt}\right|_E + 2\,\vb\Omega\times\vb v
+     + \vb\Omega\times(\vb\Omega\times\vb r).
+\end{align}
+Substituting into \cref{eq:newton} and solving for the Earth-relative acceleration:
+\begin{equation}
+  \boxed{\;
+  \left.\frac{d\vb v}{dt}\right|_E
+  = \vb a_{\text{aero}} + \vb g
+    \;\underbrace{-\,2\,\vb\Omega\times\vb v}_{\text{Coriolis}}
+    \;\underbrace{-\,\vb\Omega\times(\vb\Omega\times\vb r)}_{\text{centripetal}} \;}
+  \label{eq:rotating}
+\end{equation}
+
+\section{Spherical coordinates and the local basis}
+
+The position is described by radius $r$, longitude $\theta$ and geocentric latitude $\phi$:
+$\vb r = r\,\uh$. In ECEF components the local unit vectors are
+\begin{align}
+  \uh &= \begin{bmatrix} \cos\phi\cos\theta \\ \cos\phi\sin\theta \\ \sin\phi \end{bmatrix},&
+  \eh &= \begin{bmatrix} -\sin\theta \\ \cos\theta \\ 0 \end{bmatrix},&
+  \nh &= \begin{bmatrix} -\sin\phi\cos\theta \\ -\sin\phi\sin\theta \\ \cos\phi \end{bmatrix}.
+\end{align}
+Earth's spin axis, written in the local basis, is
+\begin{equation}
+  \zh = \sin\phi\,\uh + \cos\phi\,\nh,
+  \qquad\text{so}\qquad
+  \vb\Omega = \Omega\sin\phi\,\uh + \Omega\cos\phi\,\nh .
+  \label{eq:omega_local}
+\end{equation}
+
+As the vehicle moves, $\theta$ and $\phi$ change and the local basis turns. Differentiating
+the component expressions above with respect to time (in the Earth frame) gives
+\begin{align}
+  \frac{d\uh}{dt} &= \dot\phi\,\nh + \dot\theta\cos\phi\,\eh, \label{eq:duh}\\
+  \frac{d\eh}{dt} &= -\dot\theta\cos\phi\,\uh + \dot\theta\sin\phi\,\nh, \\
+  \frac{d\nh}{dt} &= -\dot\phi\,\uh - \dot\theta\sin\phi\,\eh .
+\end{align}
+All three are the cross product of one angular velocity with the basis vector,
+$d\vb b/dt = \vb\omega_{LE}\times\vb b$, where
+\begin{equation}
+  \vb\omega_{LE} = \dot\theta\sin\phi\,\uh \;-\; \dot\phi\,\eh \;+\; \dot\theta\cos\phi\,\nh
+  \label{eq:omegaLE}
+\end{equation}
+is the angular velocity of the local frame relative to Earth.
+
+\section{Translational kinematics}
+
+Differentiating $\vb r = r\uh$ in the Earth frame and using \cref{eq:duh}:
+\begin{equation}
+  \vb v = \dot r\,\uh + r\frac{d\uh}{dt}
+        = \dot r\,\uh + r\dot\phi\,\nh + r\dot\theta\cos\phi\,\eh .
+  \label{eq:v_components}
+\end{equation}
+The speed $V$, flight-path angle $\gamma$ and heading $\psi$ are \emph{defined} by writing the
+same velocity as
+\begin{equation}
+  \vb v = V\tth,\qquad
+  \tth = \sin\gamma\,\uh + \cos\gamma\cos\psi\,\nh + \cos\gamma\sin\psi\,\eh .
+  \label{eq:that}
+\end{equation}
+Matching the $\uh$, $\nh$ and $\eh$ components of \cref{eq:v_components,eq:that}:
+\begin{align}
+  \dot r &= V\sin\gamma, \label{eq:rdot}\\
+  \dot\phi &= \frac{V\cos\gamma\cos\psi}{r}, \label{eq:phidot}\\
+  \dot\theta &= \frac{V\cos\gamma\sin\psi}{r\cos\phi}. \label{eq:thetadot}
+\end{align}
+
+\section{Velocity dynamics}\label{sec:veldyn}
+
+Two more unit vectors complete an orthonormal triad with $\tth$. They are the
+directions in which $\tth$ moves when $\gamma$ or $\psi$ changes:
+\begin{align}
+  \gh &\equiv \pd{\tth}{\gamma} = \cos\gamma\,\uh - \sin\gamma\cos\psi\,\nh - \sin\gamma\sin\psi\,\eh,\\
+  \hh &\equiv \frac{1}{\cos\gamma}\pd{\tth}{\psi} = -\sin\psi\,\nh + \cos\psi\,\eh .
+\end{align}
+$\gh$ lies in the vertical plane, perpendicular to the velocity on the upper side; $\hh$
+is horizontal and to the right of the velocity. One can check that
+$|\gh|=|\hh|=1$ and $\tth\cdot\gh=\tth\cdot\hh=\gh\cdot\hh=0$.
+
+Differentiate $\vb v = V\tth$ in the Earth frame. The unit vector $\tth$ changes for two
+reasons: its components change because $\gamma$ and $\psi$ change, and the local basis it
+is written in turns with $\vb\omega_{LE}$. So
+\begin{align}
+  \left.\frac{d\tth}{dt}\right|_E &= \dot\gamma\,\pd{\tth}{\gamma} + \dot\psi\,\pd{\tth}{\psi}
+     + \vb\omega_{LE}\times\tth
+   = \dot\gamma\,\gh + \dot\psi\cos\gamma\,\hh + \vb\omega_{LE}\times\tth, \\[4pt]
+  \left.\frac{d\vb v}{dt}\right|_E &= \dot V\,\tth + V\dot\gamma\,\gh + V\dot\psi\cos\gamma\,\hh
+     + V\,\vb\omega_{LE}\times\tth . \label{eq:dvdt}
+\end{align}
+
+\paragraph{Transport terms.} Substituting \cref{eq:phidot,eq:thetadot} into
+\cref{eq:omegaLE} and projecting $\vb\omega_{LE}\times\tth$ onto the triad gives
+\begin{align}
+  \tth\cdot(\vb\omega_{LE}\times\tth) &= 0,\\
+  \gh\cdot(\vb\omega_{LE}\times\tth) &= -\frac{V}{r}\cos\gamma,\\
+  \hh\cdot(\vb\omega_{LE}\times\tth) &= -\frac{V}{r}\cos^2\!\gamma\,\sin\psi\tan\phi .
+\end{align}
+These are the effects of flying over a curved Earth: the local horizon tilts as the vehicle
+moves, and the direction of north changes with longitude.
+
+\paragraph{Projection.} Let $\vb a$ be the right-hand side of \cref{eq:rotating}. Dotting
+\cref{eq:dvdt} with $\tth$, $\gh$ and $\hh$ in turn, and moving the transport terms to the
+right:
+\begin{align}
+  \dot V &= \tth\cdot\vb a, \label{eq:Vdot_proj}\\
+  \dot\gamma &= \frac{1}{V}\,\gh\cdot\vb a + \frac{V}{r}\cos\gamma, \label{eq:gdot_proj}\\
+  \dot\psi &= \frac{1}{V\cos\gamma}\,\hh\cdot\vb a + \frac{V}{r}\cos\gamma\sin\psi\tan\phi .
+  \label{eq:pdot_proj}
+\end{align}
+What remains is to project each force term of $\vb a$.
+
+\section{Forces}
+
+\subsection{Aerodynamic force}
+
+Drag acts opposite the velocity. Lift is perpendicular to it, rotated from $\gh$ toward
+$\hh$ by the bank angle:
+\begin{equation}
+  \vb a_{\text{aero}} = -\aD\,\tth + \aL\big(\cos\sigma\,\gh + \sin\sigma\,\hh\big),
+\end{equation}
+\begin{equation}
+  \aL = \frac{\rho(h)\,V^2 S}{2m}\,C_L(\alpha, M),\qquad
+  \aD = \frac{\rho(h)\,V^2 S}{2m}\,C_D(\alpha, M),\qquad
+  M = \frac{V}{a_s(h)} .
+  \label{eq:aero}
+\end{equation}
+Projections:
+\[
+  \tth\cdot\vb a_{\text{aero}} = -\aD,\qquad
+  \gh\cdot\vb a_{\text{aero}} = \aL\cos\sigma,\qquad
+  \hh\cdot\vb a_{\text{aero}} = \aL\sin\sigma .
+\]
+With $\sigma>0$ the lift has a component along $+\hh$ (to the right), which turns the
+vehicle right.
+
+\subsection{Gravity with $J_2$}
+
+The gravitational potential truncated after $J_2$ is
+\begin{equation}
+  U(r,\phi) = \frac{\mu}{r}\left[1 - J_2\left(\frac{R_E}{r}\right)^2 P_2(\sin\phi)\right],
+  \qquad P_2(x) = \tfrac12\left(3x^2-1\right),
+\end{equation}
+and $\vb g = \nabla U$. In the local frame, the radial and northward components are
+\begin{align}
+  \uh\cdot\vb g &= \pd{U}{r}
+   = -\frac{\mu}{r^2} + \frac{3\mu J_2 R_E^2}{r^4}P_2(\sin\phi)
+   = -\frac{\mu}{r^2}\left[1 - \frac32 J_2\left(\frac{R_E}{r}\right)^2\left(3\sin^2\phi-1\right)\right],\\
+  \nh\cdot\vb g &= \frac1r\pd{U}{\phi}
+   = \frac{\mu}{r^2}\left(-J_2\frac{R_E^2}{r^2}\right)\frac{d P_2}{d\phi}
+   = -\frac{3\mu J_2 R_E^2}{r^4}\sin\phi\cos\phi .
+\end{align}
+Define the downward radial magnitude $g_r$ and the signed northward component $g_n$:
+\begin{equation}
+  g_r = \frac{\mu}{r^2}\left[1 - \frac32 J_2\left(\frac{R_E}{r}\right)^2\left(3\sin^2\phi-1\right)\right],
+  \qquad
+  g_n = -\frac{3\mu J_2 R_E^2}{r^4}\sin\phi\cos\phi,
+  \qquad
+  \vb g = -g_r\,\uh + g_n\,\nh .
+  \label{eq:gravity}
+\end{equation}
+Projections:
+\[
+  \tth\cdot\vb g = -g_r\sin\gamma + g_n\cos\gamma\cos\psi,\qquad
+  \gh\cdot\vb g = -g_r\cos\gamma - g_n\sin\gamma\cos\psi,\qquad
+  \hh\cdot\vb g = -g_n\sin\psi .
+\]
+
+\subsection{Coriolis and centripetal terms}
+
+Using \cref{eq:omega_local} for $\vb\Omega$, $\vb v = V\tth$ and $\vb r = r\uh$, the
+Coriolis acceleration $-2\vb\Omega\times\vb v$ projects as
+\begin{align}
+  \tth\cdot\left(-2\vb\Omega\times\vb v\right) &= 0, \\
+  \gh\cdot\left(-2\vb\Omega\times\vb v\right) &= 2\Omega V\cos\phi\sin\psi, \\
+  \hh\cdot\left(-2\vb\Omega\times\vb v\right) &= 2\Omega V\left(\sin\phi\cos\gamma - \cos\phi\sin\gamma\cos\psi\right),
+\end{align}
+and the centripetal acceleration $-\vb\Omega\times(\vb\Omega\times\vb r)$ as
+\begin{align}
+  \tth\cdot\left(-\vb\Omega\times(\vb\Omega\times\vb r)\right)
+    &= \Omega^2 r\cos\phi\left(\sin\gamma\cos\phi - \cos\gamma\sin\phi\cos\psi\right), \\
+  \gh\cdot\left(-\vb\Omega\times(\vb\Omega\times\vb r)\right)
+    &= \Omega^2 r\cos\phi\left(\cos\gamma\cos\phi + \sin\gamma\sin\phi\cos\psi\right), \\
+  \hh\cdot\left(-\vb\Omega\times(\vb\Omega\times\vb r)\right)
+    &= \Omega^2 r\sin\phi\cos\phi\sin\psi .
+\end{align}
+The Coriolis term has no component along the velocity, so it never changes the speed.
+
+\section{The assembled nonlinear model}\label{sec:full_eom}
+
+Substituting all projections into \cref{eq:Vdot_proj,eq:gdot_proj,eq:pdot_proj} and
+collecting the kinematics \cref{eq:rdot,eq:phidot,eq:thetadot}:
+\begin{align}
+  \dot r &= V\sin\gamma \label{eq:full_r}\\[4pt]
+  \dot\theta &= \frac{V\cos\gamma\sin\psi}{r\cos\phi} \\[4pt]
+  \dot\phi &= \frac{V\cos\gamma\cos\psi}{r} \\[4pt]
+  \dot V &= -\aD - g_r\sin\gamma + g_n\cos\gamma\cos\psi
+            + \Omega^2 r\cos\phi\left(\sin\gamma\cos\phi - \cos\gamma\sin\phi\cos\psi\right) \\[4pt]
+  \dot\gamma &= \frac{\aL\cos\sigma}{V} - \frac{g_r\cos\gamma}{V} - \frac{g_n\sin\gamma\cos\psi}{V}
+            + \frac{V\cos\gamma}{r} + 2\Omega\cos\phi\sin\psi \notag\\
+         &\qquad + \frac{\Omega^2 r\cos\phi}{V}\left(\cos\gamma\cos\phi + \sin\gamma\sin\phi\cos\psi\right) \\[4pt]
+  \dot\psi &= \frac{\aL\sin\sigma}{V\cos\gamma} - \frac{g_n\sin\psi}{V\cos\gamma}
+            + \frac{V\cos\gamma\sin\psi\tan\phi}{r}
+            - 2\Omega\left(\cos\phi\cos\psi\tan\gamma - \sin\phi\right) \notag\\
+         &\qquad + \frac{\Omega^2 r\sin\phi\cos\phi\sin\psi}{V\cos\gamma} \label{eq:full_psi}
+\end{align}
+In the planner, two more equations make $\alpha$ and $\sigma$ states:
+\begin{equation}
+  \dot\alpha = u_\alpha,\qquad \dot\sigma = u_\sigma .
+\end{equation}
+
+These are line for line the expressions in \code{HL20Model.xdot}.
+
+\section{Aerodynamic and atmospheric sub-models}
+
+\begin{itemize}
+\item \textbf{Altitude.} The atmosphere is a function of geodetic altitude. The model uses
+  the height above the WGS84 ellipsoid along the radius,
+  \begin{equation}
+    h = r - R_{\text{ell}}(\phi),\qquad
+    R_{\text{ell}}(\phi) = \frac{a_W b_W}{\sqrt{b_W^2\cos^2\phi + a_W^2\sin^2\phi}},\qquad
+    b_W = a_W(1-f_W),
+  \end{equation}
+  which differs from the true geodetic altitude by much less than a meter here. Using
+  $r - R_E$ instead would be wrong by about 5 km at $30^\circ$ latitude, which is a
+  factor of about 2 in density.
+\item \textbf{Atmosphere.} $\ln\rho(h)$ and $a_s(h)$ are B-spline fits of
+  \code{hgv3.atmosphere} (USSA76) sampled every 500 m (\code{atmosphereFits}).
+\item \textbf{Aerodynamics.} $C_L(\alpha,M)$ and $C_D(\alpha,M)$ are 2-D B-spline fits of
+  \code{hgv3.wind\_coefficients} on an $(\alpha,M)$ grid (\code{aeroFits}). The splines give
+  the continuous first and second derivatives the NLP solver needs; the simulator's own
+  table is linear in Mach with clamped $\alpha$.
+\item \textbf{Valid $\alpha$ window.} \code{hgv3} clamps $\alpha$ to each Mach row's range
+  and blends rows linearly in Mach. The window in which no clamping occurs is the
+  intersection of the two bracketing rows' ranges; \code{alphaLimitFits} builds a
+  continuous, conservative version $\alpha_{\text{lo}}(M)\le\alpha\le\alpha_{\text{hi}}(M)$.
+\end{itemize}
+
+\section{Relation to the \texttt{hgv3} simulator}
+
+\code{hgv3} integrates \cref{eq:newton} in ECI with fixed-step RK4. The physics is the same
+(same aero table, USSA76, point-mass plus $J_2$ gravity), with two implementation
+differences that matter:
+\begin{enumerate}
+\item It co-rotates the atmosphere about the ECI $z$ axis, while its ECEF frame comes from
+  the full ERFA precession--nutation chain. In 2026 the two axes differ by $0.148^\circ$,
+  so the simulated air mass moves about 1.2 m/s relative to ECEF at the equator. The
+  model above co-rotates about the ECEF pole.
+\item Its aero coefficients are piecewise linear in Mach with $\alpha$ clamping, where the
+  model uses smooth fits.
+\end{enumerate}
+Flying the same open-loop $(\alpha,\sigma)$ for 800 s from Mach 15, the two agree to about
+10 m in altitude and 0.1 m/s in speed, with an along-track drift of about 0.8 m/s
+(670 m after 800 s) consistent with item 1.
+
+%======================================================================
+\chapter{Linearization about a planned trajectory}\label{ch:lin}
+
+\section{Reference trajectory and perturbations}
+
+For guidance, write the model as $\dot{\vb x} = \vb f(\vb x,\vb u)$ with
+\[
+  \vb x = [\,r,\ \theta,\ \phi,\ V,\ \gamma,\ \psi\,]^T,\qquad
+  \vb u = [\,\alpha,\ \sigma\,]^T .
+\]
+The planner supplies a reference $\vb x^*(t)$, $\vb u^*(t)$ that satisfies the model:
+$\dot{\vb x}^* = \vb f(\vb x^*,\vb u^*)$. Define the perturbations
+\[
+  \delta\vb x = \vb x - \vb x^*(t),\qquad \delta\vb u = \vb u - \vb u^*(t).
+\]
+A first-order Taylor expansion of $\vb f$ about the reference gives
+\begin{equation}
+  \delta\dot{\vb x} = A(t)\,\delta\vb x + B(t)\,\delta\vb u,\qquad
+  A(t) = \left.\pd{\vb f}{\vb x}\right|_{*},\qquad
+  B(t) = \left.\pd{\vb f}{\vb u}\right|_{*},
+\end{equation}
+where $|_*$ means evaluated on the reference. The zeroth-order terms cancel precisely because
+the reference satisfies the model.
+
+\section{Simplifications for the hand derivation}\label{sec:simplify}
+
+For the hand derivation only, Earth rotation and $J_2$ are dropped, and altitude is taken
+as $h = r - R_0$ with $R_0$ the local ellipsoid radius held constant:
+\begin{equation}
+  \Omega = 0,\qquad J_2 = 0\ \Rightarrow\ g_r = g \equiv \frac{\mu}{r^2},\ g_n = 0,\qquad
+  \pd{h}{r} = 1,\ \pd{h}{\phi} = 0 .
+\end{equation}
+This was checked on the test plan by computing exact Jacobians of the full model and of the
+simplified one with CasADi:
+\begin{itemize}
+\item With states scaled to typical error sizes (1 km of position, 10 m/s, $1^\circ$), the
+  largest entry of $A$ is about $0.11$ s$^{-1}$, and rotation plus $J_2$ change any entry by at
+  most $5\times10^{-5}$ s$^{-1}$. $B$ is unchanged.
+\item The open-loop eigenvalues move by at most $2\times10^{-3}$ s$^{-1}$.
+\item The neglected latitude dependence of $h$ is about 3 m of altitude per km of northward
+  displacement.
+\end{itemize}
+Rotation and $J_2$ do dominate a few entries that are themselves tiny (for example
+$\partial\dot\gamma/\partial\psi$ comes only from the Coriolis term), but those entries
+correspond to time scales of hours. The simplified model therefore captures the structure
+that matters for control. In code, use the exact Jacobians (\cref{sec:casadi}).
+
+The simplified equations are:
+\begin{align}
+  \dot r &= V\sin\gamma \label{eq:s_r}\\
+  \dot\theta &= \frac{V\cos\gamma\sin\psi}{r\cos\phi} \\
+  \dot\phi &= \frac{V\cos\gamma\cos\psi}{r} \\
+  \dot V &= -\aD - g\sin\gamma \label{eq:s_V}\\
+  \dot\gamma &= \frac{\aL\cos\sigma}{V} - \frac{g\cos\gamma}{V} + \frac{V\cos\gamma}{r} \label{eq:s_g}\\
+  \dot\psi &= \frac{\aL\sin\sigma}{V\cos\gamma} + \frac{V\cos\gamma\sin\psi\tan\phi}{r} \label{eq:s_p}
+\end{align}
+
+\section{Aerodynamic partial derivatives}
+
+Write $k \equiv \bar q S/m = \rho V^2 S/(2m)$, so that $\aL = k\,C_L(\alpha,M)$ and
+$\aD = k\,C_D(\alpha,M)$. The coefficient slopes and atmospheric gradients are
+\[
+  C_{L,\alpha} = \pd{C_L}{\alpha},\quad C_{L,M} = \pd{C_L}{M},\quad
+  C_{D,\alpha} = \pd{C_D}{\alpha},\quad C_{D,M} = \pd{C_D}{M},
+\]
+\[
+  H_\rho \equiv -\frac{\rho}{d\rho/dh}\quad\text{(local density scale height)},\qquad
+  a_s' \equiv \frac{d a_s}{dh} .
+\]
+Partials of the intermediate quantities:
+\begin{align}
+  \pd{k}{V} &= \frac{\rho V S}{m} = \frac{2k}{V}, &
+  \pd{k}{h} &= \frac{d\rho}{dh}\frac{V^2S}{2m} = -\frac{k}{H_\rho}, \\
+  \pd{M}{V} &= \frac{1}{a_s}, &
+  \pd{M}{h} &= -\frac{V a_s'}{a_s^2} .
+\end{align}
+By the chain rule, with $\aL = k\,C_L(\alpha, M(V,h))$:
+\begin{align}
+  \pd{\aL}{V} &= \pd{k}{V}C_L + k\,C_{L,M}\pd{M}{V}
+              = \frac{2\aL}{V} + \frac{k\,C_{L,M}}{a_s}, \label{eq:dLdV}\\
+  \pd{\aL}{h} &= \pd{k}{h}C_L + k\,C_{L,M}\pd{M}{h}
+              = -\frac{\aL}{H_\rho} - \frac{k\,C_{L,M}\,V a_s'}{a_s^2}, \label{eq:dLdh}\\
+  \pd{\aL}{\alpha} &= k\,C_{L,\alpha}, \label{eq:dLda}
+\end{align}
+and identically for drag:
+\begin{align}
+  \pd{\aD}{V} &= \frac{2\aD}{V} + \frac{k\,C_{D,M}}{a_s}, &
+  \pd{\aD}{h} &= -\frac{\aD}{H_\rho} - \frac{k\,C_{D,M}\,V a_s'}{a_s^2}, &
+  \pd{\aD}{\alpha} &= k\,C_{D,\alpha} .
+\end{align}
+Gravity: $\partial g/\partial r = -2g/r$. Since $h = r - R_0$, a partial with respect to $r$
+equals the partial with respect to $h$.
+
+\section{Partial derivatives of the kinematic rows}
+
+\paragraph{$\dot r = V\sin\gamma$:}
+\[
+  \pd{\dot r}{V} = \sin\gamma,\qquad \pd{\dot r}{\gamma} = V\cos\gamma .
+\]
+\paragraph{$\dot\theta = V\cos\gamma\sin\psi/(r\cos\phi)$:}
+\begin{align*}
+  \pd{\dot\theta}{r} &= -\frac{V\cos\gamma\sin\psi}{r^2\cos\phi}, &
+  \pd{\dot\theta}{\phi} &= \frac{V\cos\gamma\sin\psi\tan\phi}{r\cos\phi}, &
+  \pd{\dot\theta}{V} &= \frac{\cos\gamma\sin\psi}{r\cos\phi}, \\
+  \pd{\dot\theta}{\gamma} &= -\frac{V\sin\gamma\sin\psi}{r\cos\phi}, &
+  \pd{\dot\theta}{\psi} &= \frac{V\cos\gamma\cos\psi}{r\cos\phi} .
+\end{align*}
+\paragraph{$\dot\phi = V\cos\gamma\cos\psi/r$:}
+\begin{align*}
+  \pd{\dot\phi}{r} &= -\frac{V\cos\gamma\cos\psi}{r^2}, &
+  \pd{\dot\phi}{V} &= \frac{\cos\gamma\cos\psi}{r}, &
+  \pd{\dot\phi}{\gamma} &= -\frac{V\sin\gamma\cos\psi}{r}, &
+  \pd{\dot\phi}{\psi} &= -\frac{V\cos\gamma\sin\psi}{r} .
+\end{align*}
+No kinematic row depends on $\theta$, $\alpha$ or $\sigma$.
+
+\section{Partial derivatives of the dynamic rows}
+
+Each partial is named $a_{ij}$ (state) or $b_{ij}$ (input) for use in \cref{ch:err}.
+
+\paragraph{Speed, $\dot V = -\aD - g\sin\gamma$:}
+\begin{align}
+  a_{Vr} &= \pd{\dot V}{r} = -\pd{\aD}{h} + \frac{2g}{r}\sin\gamma, &
+  a_{VV} &= \pd{\dot V}{V} = -\pd{\aD}{V}, &
+  a_{V\gamma} &= \pd{\dot V}{\gamma} = -g\cos\gamma, \\
+  b_{V\alpha} &= \pd{\dot V}{\alpha} = -\pd{\aD}{\alpha}, &
+  b_{V\sigma} &= \pd{\dot V}{\sigma} = 0 . \notag
+\end{align}
+
+\paragraph{Flight-path angle, $\dot\gamma = \aL\cos\sigma/V - g\cos\gamma/V + V\cos\gamma/r$:}
+\begin{align}
+  a_{\gamma r} &= \pd{\dot\gamma}{r} = \frac{\cos\sigma}{V}\pd{\aL}{h}
+     + \left(\frac{2g}{rV} - \frac{V}{r^2}\right)\cos\gamma, \\
+  a_{\gamma V} &= \pd{\dot\gamma}{V} = \frac{\cos\sigma}{V}\pd{\aL}{V} - \frac{\aL\cos\sigma}{V^2}
+     + \left(\frac{g}{V^2} + \frac1r\right)\cos\gamma, \\
+  a_{\gamma\gamma} &= \pd{\dot\gamma}{\gamma} = \left(\frac{g}{V} - \frac{V}{r}\right)\sin\gamma, \\
+  b_{\gamma\alpha} &= \pd{\dot\gamma}{\alpha} = \frac{\cos\sigma}{V}\pd{\aL}{\alpha}, \qquad
+  b_{\gamma\sigma} = \pd{\dot\gamma}{\sigma} = -\frac{\aL\sin\sigma}{V} .
+\end{align}
+
+\paragraph{Heading, $\dot\psi = \aL\sin\sigma/(V\cos\gamma) + V\cos\gamma\sin\psi\tan\phi/r$:}
+\begin{align}
+  a_{\psi r} &= \pd{\dot\psi}{r} = \frac{\sin\sigma}{V\cos\gamma}\pd{\aL}{h}
+     - \frac{V}{r^2}\cos\gamma\sin\psi\tan\phi, \\
+  a_{\psi\phi} &= \pd{\dot\psi}{\phi} = \frac{V}{r}\frac{\cos\gamma\sin\psi}{\cos^2\phi}, \\
+  a_{\psi V} &= \pd{\dot\psi}{V} = \frac{\sin\sigma}{V\cos\gamma}\pd{\aL}{V}
+     - \frac{\aL\sin\sigma}{V^2\cos\gamma} + \frac{1}{r}\cos\gamma\sin\psi\tan\phi, \\
+  a_{\psi\gamma} &= \pd{\dot\psi}{\gamma} = \frac{\aL\sin\sigma\sin\gamma}{V\cos^2\gamma}
+     - \frac{V}{r}\sin\gamma\sin\psi\tan\phi, \\
+  a_{\psi\psi} &= \pd{\dot\psi}{\psi} = \frac{V}{r}\cos\gamma\cos\psi\tan\phi, \\
+  b_{\psi\alpha} &= \pd{\dot\psi}{\alpha} = \frac{\sin\sigma}{V\cos\gamma}\pd{\aL}{\alpha}, \qquad
+  b_{\psi\sigma} = \pd{\dot\psi}{\sigma} = \frac{\aL\cos\sigma}{V\cos\gamma} .
+\end{align}
+The speed and flight-path-angle rows do not depend on $\theta$, $\phi$ or $\psi$ in the
+simplified model.
+
+\section{The linear model}
+
+With the state order $[r,\theta,\phi,V,\gamma,\psi]$ and input order $[\alpha,\sigma]$,
+writing the kinematic partials as $a_{r V}=\partial\dot r/\partial V$, and so on:
+\begin{equation}
+\begin{bmatrix}\delta\dot r\\ \delta\dot\theta\\ \delta\dot\phi\\ \delta\dot V\\ \delta\dot\gamma\\ \delta\dot\psi\end{bmatrix}
+=
+\begin{bmatrix}
+0 & 0 & 0 & a_{rV} & a_{r\gamma} & 0\\
+a_{\theta r} & 0 & a_{\theta\phi} & a_{\theta V} & a_{\theta\gamma} & a_{\theta\psi}\\
+a_{\phi r} & 0 & 0 & a_{\phi V} & a_{\phi\gamma} & a_{\phi\psi}\\
+a_{Vr} & 0 & 0 & a_{VV} & a_{V\gamma} & 0\\
+a_{\gamma r} & 0 & 0 & a_{\gamma V} & a_{\gamma\gamma} & 0\\
+a_{\psi r} & 0 & a_{\psi\phi} & a_{\psi V} & a_{\psi\gamma} & a_{\psi\psi}
+\end{bmatrix}
+\begin{bmatrix}\delta r\\ \delta\theta\\ \delta\phi\\ \delta V\\ \delta\gamma\\ \delta\psi\end{bmatrix}
++
+\begin{bmatrix}
+0 & 0\\ 0 & 0\\ 0 & 0\\ b_{V\alpha} & 0\\ b_{\gamma\alpha} & b_{\gamma\sigma}\\ b_{\psi\alpha} & b_{\psi\sigma}
+\end{bmatrix}
+\begin{bmatrix}\delta\alpha\\ \delta\sigma\end{bmatrix}.
+\label{eq:linmodel}
+\end{equation}
+
+\section{Structure of the linear model}
+
+\begin{itemize}
+\item \textbf{Longitude is ignorable.} The $\theta$ column is zero: nothing depends on
+  longitude, so it is a pure integrator (an eigenvalue at zero). This is why tracking
+  in latitude and longitude is awkward, and why \cref{ch:err} uses errors measured along
+  and across the path instead.
+\item \textbf{Longitudinal block.} $(\delta r, \delta V, \delta\gamma)$ form a closed
+  subsystem driven by $\delta\alpha$ (through $b_{V\alpha}$ and $b_{\gamma\alpha}$) and by
+  $\delta\sigma$ (through $b_{\gamma\sigma}$).
+\item \textbf{Lateral block.} $(\delta\theta, \delta\phi, \delta\psi)$ are driven by the
+  longitudinal states and by $\delta\sigma$ through $b_{\psi\sigma}$.
+\item \textbf{Coupling through bank.} When $\sigma^*\approx 0$: $b_{\gamma\sigma}\approx 0$
+  and $b_{\psi\alpha}\approx 0$, so $\alpha$ controls the longitudinal motion and $\sigma$ the
+  lateral motion, separately. This is the analog of Rajamani's decoupled lateral and
+  longitudinal vehicle models. With large $\sigma^*$, a change in bank shifts lift between
+  vertical and horizontal, which couples the two. Entry guidance exploits exactly this:
+  bank \emph{magnitude} controls range, and bank \emph{sign} controls crossrange.
+\item \textbf{Open-loop modes.} At one point on the test plan (Mach about 11), the
+  eigenvalues are a lightly damped oscillation in speed, altitude and flight-path angle
+  at about $0.026$ rad/s (period near 4 min, damping ratio about 0.06; the entry analog of
+  the phugoid), slow modes near $10^{-3}$ s$^{-1}$ (one slightly unstable), and the zero
+  eigenvalue from longitude.
+\end{itemize}
+
+%======================================================================
+\chapter{Error-state model for path following}\label{ch:err}
+
+This chapter goes back to the nonlinear equations of \cref{sec:simplify}, substitutes
+errors measured relative to the reference \emph{path}, and linearizes. It mirrors the
+derivation of Rajamani's error-state lateral model ($e_1$, $e_2$), with the speed loop
+folded into the same model because a glider's only longitudinal lever is drag.
+
+\section{Reference path}
+
+From the planned trajectory, compute the ground-track arc length $s$ along a sphere of
+radius $R_0$. Along the reference,
+\begin{equation}
+  \sdot^* = \frac{R_0}{r^*}\,V^*\cos\gamma^* ,
+\end{equation}
+and every reference quantity can be expressed as a function of $s$:
+$h^*(s)$, $V^*(s)$, $\gamma^*(s)$, $\psi^*(s)$, $\alpha^*(s)$, $\sigma^*(s)$. Define also the
+reference rates, which come straight from the model evaluated on the reference,
+\[
+  \dot V^* = f_V(\vb x^*,\vb u^*),\qquad
+  \dot\gamma^* = f_\gamma(\vb x^*,\vb u^*),\qquad
+  \dot\psi^* = f_\psi(\vb x^*,\vb u^*),
+\]
+and the geodesic curvature of the ground track, positive for a right turn:
+\begin{equation}
+  \kappa(s) = \frac{d\psi^*}{ds} - \frac{\sin\psi^*\tan\phi^*}{R_0}.
+\end{equation}
+The second term removes the change in heading caused only by the convergence of meridians;
+$\kappa$ is the curvature a local flat map would show.
+
+\paragraph{Reference point.} At each instant, $s(t)$ is chosen as the point on the reference
+ground track closest to the vehicle, so the along-track position error is zero by
+construction. How that point is found (projection, spline search, integrating $\sdot$) is
+independent of what follows.
+
+\section{Error states}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Error & Definition & Meaning \\
+\midrule
+$e_c$ & signed distance from the reference ground track & crossrange error, positive to the right \\
+$e_h$ & $h - h^*(s)$ & altitude error \\
+$e_\psi$ & $\psi - \psi^*(s)$ & heading error \\
+$e_\gamma$ & $\gamma - \gamma^*(s)$ & flight-path angle error \\
+$e_V$ & $V - V^*(s)$ & speed error at the same path position \\
+\midrule
+$\delta\alpha$ & $\alpha - \alpha^*(s)$ & angle-of-attack correction \\
+$\delta\sigma$ & $\sigma - \sigma^*(s)$ & bank correction \\
+\bottomrule
+\end{tabular}
+\end{center}
+The vehicle state is therefore $V = V^*+e_V$, $\gamma = \gamma^*+e_\gamma$,
+$\psi=\psi^*+e_\psi$, $r = r^*+e_h$, $\alpha = \alpha^*+\delta\alpha$, $\sigma=\sigma^*+\delta\sigma$,
+all reference values taken at the current $s$.
+
+\section{Rate of progress along the path}
+
+The vehicle's horizontal velocity, scaled down to the reference sphere, has magnitude
+$(R_0/r)V\cos\gamma$. Its component along the path direction is that times $\cos e_\psi$.
+A curve offset by $e_c$ toward the center of a turn of curvature $\kappa$ is shorter by the
+factor $(1-\kappa e_c)$, so the projected point advances faster by the inverse factor:
+\begin{equation}
+  \sdot = \frac{R_0}{r}\,\frac{V\cos\gamma\cos e_\psi}{1 - \kappa e_c} .
+  \label{eq:sdot}
+\end{equation}
+The component across the path changes the crossrange error:
+\begin{equation}
+  \dot e_c = \frac{R_0}{r}\,V\cos\gamma\sin e_\psi .
+  \label{eq:ecdot}
+\end{equation}
+
+\section{Nonlinear error dynamics}
+
+Differentiate each error. A reference quantity $X^*(s)$ changes only because $s$ changes:
+$\frac{d}{dt}X^*(s) = \frac{dX^*}{ds}\,\sdot$. So
+\begin{align}
+  \dot e_c &= \frac{R_0}{r}\,V\cos\gamma\sin e_\psi, \label{eq:ne_c}\\
+  \dot e_h &= V\sin\gamma - \frac{dh^*}{ds}\,\sdot, \label{eq:ne_h}\\
+  \dot e_\psi &= f_\psi(\vb x,\vb u) - \frac{d\psi^*}{ds}\,\sdot, \\
+  \dot e_\gamma &= f_\gamma(\vb x,\vb u) - \frac{d\gamma^*}{ds}\,\sdot, \\
+  \dot e_V &= f_V(\vb x,\vb u) - \frac{dV^*}{ds}\,\sdot, \label{eq:ne_V}
+\end{align}
+with $\sdot$ from \cref{eq:sdot} and $f_V$, $f_\gamma$, $f_\psi$ the right-hand sides of
+\cref{eq:s_V,eq:s_g,eq:s_p} evaluated at the \emph{actual} state and input. The reference
+slopes follow from dividing reference rates by $\sdot^*$:
+\begin{equation}
+  \frac{dh^*}{ds} = \frac{V^*\sin\gamma^*}{\sdot^*} = \frac{r^*}{R_0}\tan\gamma^*,\qquad
+  \frac{d\psi^*}{ds} = \frac{\dot\psi^*}{\sdot^*},\qquad
+  \frac{d\gamma^*}{ds} = \frac{\dot\gamma^*}{\sdot^*},\qquad
+  \frac{dV^*}{ds} = \frac{\dot V^*}{\sdot^*} .
+\end{equation}
+These play the role of Rajamani's $\dot\psi_{\text{des}}$ terms: they are the rates at which
+the reference itself moves.
+
+\section{Linearization}
+
+\subsection*{Step 1: linearize the path rate}
+
+Expand \cref{eq:sdot} to first order about zero error. Each partial is evaluated at the
+reference:
+\begin{align}
+  \pd{\sdot}{e_V} &= \frac{R_0}{r^*}\cos\gamma^* = \frac{\sdot^*}{V^*}, &
+  \pd{\sdot}{e_\gamma} &= -\frac{R_0}{r^*}V^*\sin\gamma^* = -\sdot^*\tan\gamma^*, \notag\\
+  \pd{\sdot}{e_h} &= -\frac{R_0}{r^{*2}}V^*\cos\gamma^* = -\frac{\sdot^*}{r^*}, &
+  \pd{\sdot}{e_c} &= \sdot^*\kappa, \qquad
+  \pd{\sdot}{e_\psi} = 0 . \notag
+\end{align}
+The heading-error partial vanishes because $\partial\cos e_\psi/\partial e_\psi = 0$ at
+$e_\psi=0$. So
+\begin{equation}
+  \sdot \approx \sdot^*\left(1 + \frac{e_V}{V^*} - \tan\gamma^*\,e_\gamma - \frac{e_h}{r^*} + \kappa\,e_c\right).
+  \label{eq:sdot_lin}
+\end{equation}
+
+\subsection*{Step 2: crossrange row}
+
+From \cref{eq:ne_c}, with $\sin e_\psi\approx e_\psi$:
+\begin{equation}
+  \dot e_c = \sdot^*\,e_\psi .
+\end{equation}
+
+\subsection*{Step 3: altitude row}
+
+Linearize \cref{eq:ne_h} term by term. The first term gives
+$\delta(V\sin\gamma) = \sin\gamma^*\,e_V + V^*\cos\gamma^*\,e_\gamma$. The second term is
+$\frac{r^*}{R_0}\tan\gamma^*$ times \cref{eq:sdot_lin}. Collecting by error:
+\begin{align*}
+  e_V:&\quad \sin\gamma^* - \frac{r^*}{R_0}\tan\gamma^*\,\frac{\sdot^*}{V^*}
+        = \sin\gamma^* - \sin\gamma^* = 0,\\
+  e_\gamma:&\quad V^*\cos\gamma^* + \frac{r^*}{R_0}\tan\gamma^*\,\sdot^*\tan\gamma^*
+        = V^*\cos\gamma^* + V^*\frac{\sin^2\gamma^*}{\cos\gamma^*} = \frac{V^*}{\cos\gamma^*},\\
+  e_h:&\quad \frac{r^*}{R_0}\tan\gamma^*\,\frac{\sdot^*}{r^*} = \frac{V^*\sin\gamma^*}{r^*},\\
+  e_c:&\quad -\frac{r^*}{R_0}\tan\gamma^*\,\sdot^*\kappa = -V^*\kappa\sin\gamma^* .
+\end{align*}
+Speed error drops out: going faster along the same path changes where you are along it,
+not your height above it. So
+\begin{equation}
+  \dot e_h = -V^*\kappa\sin\gamma^*\,e_c + \frac{V^*\sin\gamma^*}{r^*}\,e_h + \frac{V^*}{\cos\gamma^*}\,e_\gamma .
+\end{equation}
+
+\subsection*{Step 4: heading, flight-path angle and speed rows}
+
+For each of the three dynamic rows, $f_\square(\vb x,\vb u)$ linearizes to the
+\cref{ch:lin} partials, and the path-rate term contributes $-\dot\square^*/\sdot^*$ times
+\cref{eq:sdot_lin}. For heading:
+\begin{align}
+  \dot e_\psi ={}& a_{\psi r}\,e_h + a_{\psi V}\,e_V + a_{\psi\gamma}\,e_\gamma + a_{\psi\psi}\,e_\psi
+       + b_{\psi\alpha}\,\delta\alpha + b_{\psi\sigma}\,\delta\sigma \notag\\
+     & - \dot\psi^*\left(\frac{e_V}{V^*} - \tan\gamma^*\,e_\gamma - \frac{e_h}{r^*} + \kappa\,e_c\right),
+\end{align}
+and collecting terms:
+\begin{align}
+  \dot e_\psi ={}& -\kappa\,\dot\psi^*\,e_c
+    + \left(a_{\psi r} + \frac{\dot\psi^*}{r^*}\right)e_h
+    + a_{\psi\psi}\,e_\psi
+    + \left(a_{\psi\gamma} + \dot\psi^*\tan\gamma^*\right)e_\gamma
+    + \left(a_{\psi V} - \frac{\dot\psi^*}{V^*}\right)e_V \notag\\
+   & + b_{\psi\alpha}\,\delta\alpha + b_{\psi\sigma}\,\delta\sigma, \\[6pt]
+  \dot e_\gamma ={}& -\kappa\,\dot\gamma^*\,e_c
+    + \left(a_{\gamma r} + \frac{\dot\gamma^*}{r^*}\right)e_h
+    + \left(a_{\gamma\gamma} + \dot\gamma^*\tan\gamma^*\right)e_\gamma
+    + \left(a_{\gamma V} - \frac{\dot\gamma^*}{V^*}\right)e_V \notag\\
+   & + b_{\gamma\alpha}\,\delta\alpha + b_{\gamma\sigma}\,\delta\sigma, \\[6pt]
+  \dot e_V ={}& -\kappa\,\dot V^*\,e_c
+    + \left(a_{Vr} + \frac{\dot V^*}{r^*}\right)e_h
+    + \left(a_{V\gamma} + \dot V^*\tan\gamma^*\right)e_\gamma
+    + \left(a_{VV} - \frac{\dot V^*}{V^*}\right)e_V
+    + b_{V\alpha}\,\delta\alpha .
+\end{align}
+All $a_{ij}$ and $b_{ij}$ are the \cref{ch:lin} expressions evaluated on the reference at
+the current $s$. The heading error does not appear in the $\dot e_\gamma$ and $\dot e_V$ rows
+because $f_\gamma$ and $f_V$ do not depend on $\psi$ once rotation is dropped.
+
+\subsection*{Step 5: state-space form}
+
+With $\vb e = [\,e_c,\ e_h,\ e_\psi,\ e_\gamma,\ e_V\,]^T$ and $\delta\vb u = [\,\delta\alpha,\ \delta\sigma\,]^T$:
+\begin{equation}
+  \dot{\vb e} = A_e(s)\,\vb e + B_e(s)\,\delta\vb u,
+\end{equation}
+\begin{equation}
+A_e =
+\begin{bmatrix}
+0 & 0 & \sdot^* & 0 & 0\\[4pt]
+-V^*\kappa\sin\gamma^* & \dfrac{V^*\sin\gamma^*}{r^*} & 0 & \dfrac{V^*}{\cos\gamma^*} & 0\\[10pt]
+-\kappa\dot\psi^* & a_{\psi r}+\dfrac{\dot\psi^*}{r^*} & a_{\psi\psi} & a_{\psi\gamma}+\dot\psi^*\tan\gamma^* & a_{\psi V}-\dfrac{\dot\psi^*}{V^*}\\[10pt]
+-\kappa\dot\gamma^* & a_{\gamma r}+\dfrac{\dot\gamma^*}{r^*} & 0 & a_{\gamma\gamma}+\dot\gamma^*\tan\gamma^* & a_{\gamma V}-\dfrac{\dot\gamma^*}{V^*}\\[10pt]
+-\kappa\dot V^* & a_{Vr}+\dfrac{\dot V^*}{r^*} & 0 & a_{V\gamma}+\dot V^*\tan\gamma^* & a_{VV}-\dfrac{\dot V^*}{V^*}
+\end{bmatrix},
+\qquad
+B_e =
+\begin{bmatrix}
+0 & 0\\[4pt] 0 & 0\\[10pt] b_{\psi\alpha} & b_{\psi\sigma}\\[10pt] b_{\gamma\alpha} & b_{\gamma\sigma}\\[10pt] b_{V\alpha} & 0
+\end{bmatrix}.
+\label{eq:errmodel}
+\end{equation}
+
+\section{Feedforward and why the model has no disturbance term}
+
+At $\vb e = 0$ and $\delta\vb u = 0$, every row of the nonlinear error dynamics is exactly
+zero, because the reference input $\vb u^*(s)$ reproduces the reference motion. In
+Rajamani's lane-keeping model, the road curvature enters as a disturbance term
+($\dot\psi_{\text{des}}$) that the feedback must reject unless a feedforward steering angle
+is added. Here the planner already supplies that feedforward: $\alpha^*(s)$ and
+$\sigma^*(s)$ are the inputs that fly the path exactly. The commands are
+\begin{equation}
+  \alpha_c = \alpha^*(s) + \delta\alpha,\qquad \sigma_c = \sigma^*(s) + \delta\sigma,
+\end{equation}
+and the feedback only corrects deviations.
+
+\section{Arc length as the independent variable}
+
+To schedule on $s$ rather than time, divide by $\sdot$. To first order,
+$d\vb e/ds = (1/\sdot^*)\,\dot{\vb e}$, because the correction to $\sdot$ multiplies $\dot{\vb e}$,
+which is already first order:
+\begin{equation}
+  \frac{d\vb e}{ds} = \frac{1}{\sdot^*}A_e(s)\,\vb e + \frac{1}{\sdot^*}B_e(s)\,\delta\vb u .
+\end{equation}
+
+\section{Structure and controllability}
+
+\begin{itemize}
+\item \textbf{Lateral chain:} $\delta\sigma \xrightarrow{\ b_{\psi\sigma}\ } e_\psi
+  \xrightarrow{\ \sdot^*\ } e_c$. A double integrator from bank to crossrange, exactly like
+  steering to lateral offset in Rajamani's model. $b_{\psi\sigma} = \aL\cos\sigma^*/(V^*\cos\gamma^*)$
+  is largest near wings-level and vanishes at $\sigma^* = \pm90^\circ$.
+\item \textbf{Vertical chain:} $(\delta\alpha,\delta\sigma) \to e_\gamma \to e_h$, with
+  $b_{\gamma\sigma} = -\aL\sin\sigma^*/V^*$. Bank changes vertical lift only when the
+  reference is already banked.
+\item \textbf{Energy:} $\delta\alpha \xrightarrow{\ b_{V\alpha}\ } e_V$ through drag, and
+  $e_\gamma \xrightarrow{\ a_{V\gamma}=-g\cos\gamma\ } e_V$ through gravity. This is what
+  replaces the throttle loop of a powered vehicle.
+\item \textbf{Locality.} The model is valid for small errors. Large crossrange corrections in
+  entry guidance are made by \emph{bank reversals} (sign changes of $\sigma$), which are
+  outside any linear model and are usually handled by logic, such as a heading-error
+  corridor.
+\end{itemize}
+
+\section{What was neglected}
+
+\begin{itemize}
+\item Earth rotation and $J_2$ in the partials (\cref{sec:simplify}). Keep them by using exact
+  Jacobians in code.
+\item The effect of $e_c$ on latitude, which would add $a_{\psi\phi}\,(-\sin\psi^*/R_0)\,e_c$ to
+  the heading row: about $10^{-7}$ rad/s per km of crossrange.
+\item The difference between the heading reference at the vehicle and at the projected
+  point (meridian convergence), of order $e_c\tan\phi/R_0$: about $0.005^\circ$ per km.
+\end{itemize}
+
+%======================================================================
+\chapter{LQR design on the error-state model}\label{ch:lqr}
+
+\section{Cost and weights}
+
+\begin{equation}
+  J = \int\left(\vb e^T Q\,\vb e + \delta\vb u^T R\,\delta\vb u\right)dt,\qquad
+  \delta\vb u = -K(s)\,\vb e .
+\end{equation}
+Bryson's rule sets diagonal weights from the largest acceptable value of each quantity:
+$Q_{ii} = 1/e_{i,\max}^2$ and $R_{jj} = 1/\delta u_{j,\max}^2$. Reasonable starting values:
+\begin{center}
+\begin{tabular}{@{}lll@{\qquad}lll@{}}
+\toprule
+Error & Largest acceptable & $Q_{ii}$ & Input & Largest correction & $R_{jj}$ \\
+\midrule
+$e_c$ & 1 km & $10^{-6}$ m$^{-2}$ & $\delta\alpha$ & $2^\circ$ & $1/(0.0349)^2$ \\
+$e_h$ & 500 m & $4\times10^{-6}$ m$^{-2}$ & $\delta\sigma$ & $10^\circ$ & $1/(0.1745)^2$ \\
+$e_\psi$ & $1^\circ$ & $1/(0.0175)^2$ & & & \\
+$e_\gamma$ & $0.5^\circ$ & $1/(0.0087)^2$ & & & \\
+$e_V$ & 20 m/s & $2.5\times10^{-3}$ (m/s)$^{-2}$ & & & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Computing the gains}
+
+\paragraph{Frozen-point (gain scheduling).} At each reference node $s_k$, solve the algebraic
+Riccati equation
+\begin{equation}
+  A_e^T P + P A_e - P B_e R^{-1} B_e^T P + Q = 0,\qquad K_k = R^{-1}B_e^T P,
+\end{equation}
+and interpolate $K(s)$ between nodes (\code{scipy.linalg.solve\_continuous\_are}). This is the
+form that carries over directly to aircraft gain scheduling. It assumes the dynamics change
+slowly relative to the closed-loop bandwidth.
+
+\paragraph{Finite horizon.} The trajectory ends at a target, so the more principled form
+integrates the differential Riccati equation backward from the end:
+\begin{equation}
+  -\dot P = A_e^T P + P A_e - P B_e R^{-1} B_e^T P + Q,\qquad P(t_f) = Q_f,\qquad
+  K(t) = R^{-1}B_e^T P(t).
+\end{equation}
+In arc length, use $A_e/\sdot^*$, $B_e/\sdot^*$ and weights $Q/\sdot^*$, $R/\sdot^*$
+(since $dt = ds/\sdot$), integrating backward in $s$.
+
+\section{The control law}
+
+\begin{align}
+  \alpha_c &= \alpha^*(s) - K_{\alpha c}e_c - K_{\alpha h}e_h - K_{\alpha\psi}e_\psi - K_{\alpha\gamma}e_\gamma - K_{\alpha V}e_V, \\
+  \sigma_c &= \sigma^*(s) - K_{\sigma c}e_c - K_{\sigma h}e_h - K_{\sigma\psi}e_\psi - K_{\sigma\gamma}e_\gamma - K_{\sigma V}e_V,
+\end{align}
+then saturate: $\alpha_{\text{lo}}(M)\le\alpha_c\le\alpha_{\text{hi}}(M)$, $|\sigma_c|\le\sigma_{\max}$,
+and rate-limit if the inner loop needs it.
+
+\section{Getting $A$ and $B$ numerically}\label{sec:casadi}
+
+The hand-derived partials are for understanding and for sanity checks. In code, take exact
+Jacobians of the full model (rotation, $J_2$, spline aerodynamics) with CasADi. The planner's
+model treats $\alpha$ and $\sigma$ as states; for guidance they are inputs, so split the state:
+\begin{lstlisting}
+import casadi as ca
+x = ca.MX.sym("x", 6)                  # [r, lon, lat, V, gamma, psi]
+u = ca.MX.sym("u", 2)                  # [alpha, sigma]: inputs to the guidance loop
+xdot = model.f(ca.vertcat(x, u), ca.DM.zeros(2))[:6]
+AB = ca.Function("AB", [x, u], [ca.jacobian(xdot, x), ca.jacobian(xdot, u)])
+A, B = AB(res.x[:6, k], res.x[6:, k])  # at node k of the plan
+\end{lstlisting}
+The entries of $A$ and $B$ correspond to the $a_{ij}$ and $b_{ij}$ of \cref{ch:lin}. $A_e$ and
+$B_e$ then follow from \cref{eq:errmodel} using the reference rates $\dot V^*$, $\dot\gamma^*$,
+$\dot\psi^*$ and the curvature $\kappa$. Alternatively, write the nonlinear error dynamics
+\cref{eq:ne_c}--\cref{eq:ne_V} as a CasADi function of $(\vb e,\delta\vb u)$ and differentiate it
+at zero.
+
+\section{Checking the design}
+
+Classical verification applies whatever the design method: break the loop at each input
+($\delta\alpha$, $\delta\sigma$) of the closed loop, compute the loop transfer function, and report gain and
+phase margins at frozen points along the path. Continuous-time LQR with full-state feedback
+guarantees at least $60^\circ$ of phase margin and a gain margin from $-6$ dB to $+\infty$ at
+the plant input, but those guarantees disappear once an estimator, actuator lag or time delay
+is in the loop (Doyle, 1978), so they must be checked. Then run Monte Carlo dispersions
+(density, aerodynamic coefficients, mass, initial state) in the simulator.
+
+%======================================================================
+\chapter{Inner-loop attitude control: classical and NDI}\label{ch:inner}
+
+In a 6-DOF simulation, guidance commands $\alpha_c$, $\sigma_c$ and $\beta_c = 0$, and an
+attitude control loop makes the airframe follow them using control surfaces (and reaction
+control jets at low dynamic pressure). This chapter gives the models for that loop and the
+structure of the two common designs. It uses \emph{forces} $L$, $D$, $Y$ (newtons) rather than
+the accelerations of earlier chapters, with $\aL = L/m$.
+
+\section{Notation for this chapter}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+$p, q, r$ & body-axis roll, pitch, yaw rates \\
+$\alpha, \beta$ & angle of attack, sideslip \\
+$\mu$ & wind-axis bank angle (the $\sigma$ of earlier chapters) \\
+$\chi$ & flight-path heading (the $\psi$ of earlier chapters) \\
+$L, D, Y$ & lift, drag, side force in wind axes [N] \\
+$\mathcal L, \mathcal M, \mathcal N$ & rolling, pitching, yawing moments about the center of mass [N\,m] \\
+$\vb\delta$ & vector of control-surface deflections \\
+\bottomrule
+\end{tabular}
+\end{center}
+For the fast attitude dynamics, the Earth is treated as flat and non-rotating. The neglected
+terms are of order $V/r$ and $\Omega$ (about $10^{-3}$ rad/s), far below attitude bandwidths
+(about 1 rad/s).
+
+\section{Rotational dynamics}
+
+Euler's equation $I\dot{\vb\omega} + \vb\omega\times I\vb\omega = \vb M$, with the symmetric
+inertia tensor
+$I = \begin{bmatrix} I_{xx} & 0 & -I_{xz}\\ 0 & I_{yy} & 0\\ -I_{xz} & 0 & I_{zz}\end{bmatrix}$,
+written out by component:
+\begin{align}
+  I_{xx}\dot p - I_{xz}\dot r &= \mathcal L + (I_{yy}-I_{zz})\,q r + I_{xz}\,p q, \\
+  I_{yy}\dot q &= \mathcal M + (I_{zz}-I_{xx})\,p r + I_{xz}\,(r^2 - p^2), \\
+  I_{zz}\dot r - I_{xz}\dot p &= \mathcal N + (I_{xx}-I_{yy})\,p q - I_{xz}\,q r .
+\end{align}
+The HL-20 data set $I_{xz}=0$, so each axis can be solved on its own:
+\begin{align}
+  \dot p &= \frac{1}{I_{xx}}\left[\mathcal L + (I_{yy}-I_{zz})\,q r\right], \label{eq:pdot}\\
+  \dot q &= \frac{1}{I_{yy}}\left[\mathcal M + (I_{zz}-I_{xx})\,p r\right], \label{eq:qdot}\\
+  \dot r &= \frac{1}{I_{zz}}\left[\mathcal N + (I_{xx}-I_{yy})\,p q\right]. \label{eq:rdot_body}
+\end{align}
+
+\section{Aerodynamic moments}
+
+\begin{align}
+  \mathcal L &= \bar q S b\left[C_{l_\beta}\beta + C_{l_p}\frac{p b}{2V} + C_{l_r}\frac{r b}{2V} + C_{l,\vb\delta}\,\vb\delta\right],\\
+  \mathcal M &= \bar q S \bar c\left[C_{m_0}(\alpha,M) + C_{m_q}\frac{q\bar c}{2V} + C_{m,\vb\delta}\,\vb\delta\right],\\
+  \mathcal N &= \bar q S b\left[C_{n_\beta}\beta + C_{n_p}\frac{p b}{2V} + C_{n_r}\frac{r b}{2V} + C_{n,\vb\delta}\,\vb\delta\right].
+\end{align}
+The \code{hgv3} aero file contains $C_m$, the sideslip derivatives $C_{Y_\beta}$, $C_{l_\beta}$,
+$C_{n_\beta}$ (per \emph{degree} of $\beta$) and the damping derivatives $C_{m_q}$, $C_{l_p}$,
+$C_{l_r}$, $C_{n_p}$, $C_{n_r}$. The control-surface terms $C_{\cdot,\vb\delta}$ are not in that file;
+take them from \code{hgv6}'s effector model.
+
+Throughout, split each moment into a part independent of the controls and a part linear in
+them:
+\begin{equation}
+  \mathcal L = \mathcal L_0(\vb x) + \bar q S b\, C_{l,\vb\delta}\,\vb\delta,\quad
+  \mathcal M = \mathcal M_0(\vb x) + \bar q S \bar c\, C_{m,\vb\delta}\,\vb\delta,\quad
+  \mathcal N = \mathcal N_0(\vb x) + \bar q S b\, C_{n,\vb\delta}\,\vb\delta .
+  \label{eq:moment_split}
+\end{equation}
+
+\section{Wind-axis attitude kinematics}
+
+These relate the body rates to the rates of the controlled angles. They are the key
+equations for both designs:
+\begin{align}
+  \dot\alpha &= q - \tan\beta\left(p\cos\alpha + r\sin\alpha\right)
+     - \frac{L - m g\cos\gamma\cos\mu}{m V\cos\beta}, \label{eq:alphadot}\\[4pt]
+  \dot\beta &= p\sin\alpha - r\cos\alpha + \frac{Y + m g\cos\gamma\sin\mu}{m V}, \label{eq:betadot}\\[4pt]
+  \dot\mu &= \frac{p\cos\alpha + r\sin\alpha}{\cos\beta}
+     + \frac{L\left(\tan\gamma\sin\mu + \tan\beta\right) + Y\tan\gamma\cos\mu
+             - m g\cos\gamma\cos\mu\tan\beta}{m V}. \label{eq:mudot}
+\end{align}
+The flight-path equations in the same frame are
+\begin{equation}
+  \dot\gamma = \frac{L\cos\mu - Y\sin\mu - m g\cos\gamma}{m V},\qquad
+  \dot\chi = \frac{L\sin\mu + Y\cos\mu}{m V\cos\gamma} .
+\end{equation}
+With $Y=0$ and the curved-Earth terms restored, these are the 3-DOF equations
+\cref{eq:s_g,eq:s_p} with $\mu = \sigma$ and $\chi = \psi$.
+
+\paragraph{Roll about the velocity vector.} In \cref{eq:mudot}, the body rates enter as
+$p\cos\alpha + r\sin\alpha$, the roll rate about the velocity vector. At the high angles of
+attack used in entry ($20^\circ$ to $40^\circ$), rolling about the body $x$ axis alone
+($r=0$) would, from \cref{eq:betadot}, convert directly into sideslip at the rate
+$p\sin\alpha$. Banking must therefore be done about the velocity vector, with
+$r = p\tan\alpha$. Both designs below have to respect this.
+
+\section{Classical gain-scheduled design}
+
+\subsection{Linearization about a wings-level trim}
+
+At each design point $(M, \bar q, \alpha^*)$ along the trajectory, linearize about
+$\beta = 0$, $\mu = 0$, $p = r = 0$. The trim values of $V$ and $\gamma$ are held fixed
+(they change slowly compared with attitude).
+
+\paragraph{Longitudinal (short period).} From \cref{eq:alphadot,eq:qdot}:
+\begin{align}
+  \delta\dot\alpha &= \delta q - \frac{\delta L}{mV}
+    = Z_\alpha\,\delta\alpha + \delta q + Z_{\delta}\,\delta\delta_e, \\
+  \delta\dot q &= M_\alpha\,\delta\alpha + M_q\,\delta q + M_{\delta}\,\delta\delta_e,
+\end{align}
+with the dimensional derivatives
+\begin{align}
+  Z_\alpha &= -\frac{\bar q S C_{L_\alpha}}{m V}, &
+  Z_\delta &= -\frac{\bar q S C_{L,\delta_e}}{m V}, \notag\\
+  M_\alpha &= \frac{\bar q S\bar c\, C_{m_\alpha}}{I_{yy}}, &
+  M_q &= \frac{\bar q S\bar c^2 C_{m_q}}{2 V I_{yy}}, &
+  M_\delta &= \frac{\bar q S\bar c\, C_{m,\delta_e}}{I_{yy}} .
+\end{align}
+Here $\delta_e$ is whichever symmetric surface produces pitching moment. The characteristic
+equation is
+\begin{equation}
+  s^2 - \left(Z_\alpha + M_q\right)s + \left(Z_\alpha M_q - M_\alpha\right) = 0,
+  \qquad
+  \omega_{sp}^2 = Z_\alpha M_q - M_\alpha,\quad
+  2\zeta_{sp}\omega_{sp} = -\left(Z_\alpha + M_q\right).
+\end{equation}
+
+\paragraph{Lateral-directional.} From \cref{eq:betadot,eq:mudot,eq:pdot,eq:rdot_body}:
+\begin{align}
+  \delta\dot\beta &= Y_\beta\,\delta\beta + \sin\alpha^*\,\delta p - \cos\alpha^*\,\delta r
+     + \frac{g\cos\gamma^*}{V}\,\delta\mu + Y_{\vb\delta}\,\delta\vb\delta, \\
+  \delta\dot p &= L_\beta\,\delta\beta + L_p\,\delta p + L_r\,\delta r + L_{\vb\delta}\,\delta\vb\delta, \\
+  \delta\dot r &= N_\beta\,\delta\beta + N_p\,\delta p + N_r\,\delta r + N_{\vb\delta}\,\delta\vb\delta, \\
+  \delta\dot\mu &= \left(\frac{L^* - m g\cos\gamma^*}{m V} + Y_\beta\tan\gamma^*\right)\delta\beta
+     + \cos\alpha^*\,\delta p + \sin\alpha^*\,\delta r + \frac{L^*\tan\gamma^*}{m V}\,\delta\mu
+     + \tan\gamma^*\,Y_{\vb\delta}\,\delta\vb\delta ,
+\end{align}
+with
+\begin{align}
+  Y_\beta &= \frac{\bar q S C_{Y_\beta}}{m V}, &
+  L_\beta &= \frac{\bar q S b\, C_{l_\beta}}{I_{xx}}, &
+  L_p &= \frac{\bar q S b^2 C_{l_p}}{2 V I_{xx}}, &
+  L_r &= \frac{\bar q S b^2 C_{l_r}}{2 V I_{xx}}, \notag\\
+  & &
+  N_\beta &= \frac{\bar q S b\, C_{n_\beta}}{I_{zz}}, &
+  N_p &= \frac{\bar q S b^2 C_{n_p}}{2 V I_{zz}}, &
+  N_r &= \frac{\bar q S b^2 C_{n_r}}{2 V I_{zz}}.
+\end{align}
+Convert the \code{hgv3} sideslip derivatives from per degree to per radian (multiply by
+$180/\pi$) before using them here.
+
+\subsection{Control structure}
+
+\begin{itemize}
+\item \textbf{Pitch:} an inner pitch-rate loop for damping, and an outer proportional-integral
+  (PI) loop on $\alpha$ that commands it:
+  $q_c = K_\alpha(\alpha_c - \alpha) + K_{I\alpha}\int(\alpha_c - \alpha)\,dt$, then
+  $\delta_e = K_q(q_c - q)$.
+\item \textbf{Roll:} a PI loop on $\mu$ commanding the stability-axis roll rate
+  $p_{s,c} = p_c\cos\alpha + r_c\sin\alpha$, implemented as $p_c$ and $r_c = p_c\tan\alpha$ so
+  the roll is about the velocity vector.
+\item \textbf{Yaw:} drive $\beta$ to zero (turn coordination), with yaw-rate damping through a
+  washout filter so steady turning is not opposed.
+\item \textbf{Scheduling:} control power scales with $\bar q$, so gains are scheduled on
+  $\bar q$ and Mach, at minimum $K \propto 1/\bar q$ to hold loop gain constant.
+\item \textbf{Requirements:} at every design point, with the loop broken at each actuator,
+  at least 6 dB of gain margin and $45^\circ$ of phase margin. Keep bandwidths separated:
+  guidance about 0.05--0.2 rad/s, attitude about 1--3 rad/s, actuators 20 rad/s or more.
+\end{itemize}
+
+\section{Nonlinear dynamic inversion (NDI)}
+
+\subsection{The idea, written out}
+
+Suppose a set of outputs $\vb y$ obeys
+\begin{equation}
+  \dot{\vb y} = \vb f(\vb x) + G(\vb x)\,\vb v,
+  \label{eq:affine}
+\end{equation}
+where $\vb v$ is the input, $\vb f$ collects everything the input does not affect, and $G$ is
+square and invertible. Choose the input
+\begin{equation}
+  \vb v = G(\vb x)^{-1}\left[\vb\nu - \vb f(\vb x)\right].
+\end{equation}
+Substituting back into \cref{eq:affine}:
+\begin{equation}
+  \dot{\vb y} = \vb f(\vb x) + G(\vb x)\,G(\vb x)^{-1}\left[\vb\nu - \vb f(\vb x)\right] = \vb\nu .
+\end{equation}
+The nonlinear system now behaves as a set of decoupled integrators driven by the
+\emph{pseudo-control} $\vb\nu$. Choose $\vb\nu$ as a simple linear law, for example
+\begin{equation}
+  \nu_i = \dot y_{i,c} + K_{P,i}\left(y_{i,c} - y_i\right) + K_{I,i}\int\left(y_{i,c} - y_i\right)dt,
+\end{equation}
+which gives each channel first-order (or, with the integral, second-order) linear error
+dynamics set by the gains. Conditions: $G$ must be invertible along the trajectory, and the
+\emph{internal dynamics}, the states not directly controlled ($V$, $\gamma$, $\chi$ here), must
+be stable or handled by another loop (guidance).
+
+For the HL-20, the controlled angles $(\alpha,\beta,\mu)$ depend on the body rates, and the
+body rates depend on the control surfaces. So the inversion is done in two stages, using
+time-scale separation: the rates respond much faster than the angles.
+
+\subsection{Slow loop: angles to body rates}
+
+From \cref{eq:alphadot,eq:betadot,eq:mudot}, the angle rates are affine in $(p, q, r)$:
+\begin{equation}
+  \begin{bmatrix}\dot\alpha\\ \dot\beta\\ \dot\mu\end{bmatrix}
+  = \begin{bmatrix} f_\alpha\\ f_\beta\\ f_\mu \end{bmatrix}
+  + G_s(\alpha,\beta)\begin{bmatrix} p\\ q\\ r\end{bmatrix},
+\end{equation}
+\begin{align}
+  f_\alpha &= -\frac{L - m g\cos\gamma\cos\mu}{m V\cos\beta}, \\
+  f_\beta &= \frac{Y + m g\cos\gamma\sin\mu}{m V}, \\
+  f_\mu &= \frac{L\left(\tan\gamma\sin\mu + \tan\beta\right) + Y\tan\gamma\cos\mu
+            - m g\cos\gamma\cos\mu\tan\beta}{m V}, \\[4pt]
+  G_s &= \begin{bmatrix}
+    -\tan\beta\cos\alpha & 1 & -\tan\beta\sin\alpha\\
+    \sin\alpha & 0 & -\cos\alpha\\
+    \dfrac{\cos\alpha}{\cos\beta} & 0 & \dfrac{\sin\alpha}{\cos\beta}
+  \end{bmatrix},\qquad
+  \det G_s = -\frac{1}{\cos\beta}.
+\end{align}
+$G_s$ is invertible for all $|\beta|<90^\circ$, with
+\begin{equation}
+  G_s^{-1} = \begin{bmatrix}
+    0 & \sin\alpha & \cos\alpha\cos\beta\\
+    1 & 0 & \sin\beta\\
+    0 & -\cos\alpha & \sin\alpha\cos\beta
+  \end{bmatrix}.
+\end{equation}
+With desired angle rates $\nu_\alpha$, $\nu_\beta$, $\nu_\mu$, the commanded body rates are,
+written out:
+\begin{align}
+  p_c &= \sin\alpha\left(\nu_\beta - f_\beta\right) + \cos\alpha\cos\beta\left(\nu_\mu - f_\mu\right), \\
+  q_c &= \left(\nu_\alpha - f_\alpha\right) + \sin\beta\left(\nu_\mu - f_\mu\right), \\
+  r_c &= -\cos\alpha\left(\nu_\beta - f_\beta\right) + \sin\alpha\cos\beta\left(\nu_\mu - f_\mu\right).
+\end{align}
+With $\beta \approx 0$, a pure bank command gives $p_c = \cos\alpha\,\nu_\mu'$ and
+$r_c = \sin\alpha\,\nu_\mu'$, so $r_c/p_c = \tan\alpha$: the inversion automatically rolls
+about the velocity vector. The desired rates are simple linear laws:
+\begin{equation}
+  \nu_\alpha = \omega_\alpha(\alpha_c - \alpha),\qquad
+  \nu_\beta = \omega_\beta(0 - \beta),\qquad
+  \nu_\mu = \omega_\mu(\mu_c - \mu),
+\end{equation}
+optionally with integral terms. $L$ and $Y$ in $f_\alpha$, $f_\beta$, $f_\mu$ come from the
+aerodynamic model at the current state.
+
+\subsection{Fast loop: body rates to control moments}
+
+From \cref{eq:pdot,eq:qdot,eq:rdot_body} with the split \cref{eq:moment_split}:
+\begin{align}
+  \dot p &= \frac{(I_{yy}-I_{zz})\,q r + \mathcal L_0}{I_{xx}} + \frac{\bar q S b}{I_{xx}}C_{l,\vb\delta}\,\vb\delta, \\
+  \dot q &= \frac{(I_{zz}-I_{xx})\,p r + \mathcal M_0}{I_{yy}} + \frac{\bar q S \bar c}{I_{yy}}C_{m,\vb\delta}\,\vb\delta, \\
+  \dot r &= \frac{(I_{xx}-I_{yy})\,p q + \mathcal N_0}{I_{zz}} + \frac{\bar q S b}{I_{zz}}C_{n,\vb\delta}\,\vb\delta .
+\end{align}
+With desired rate derivatives $\nu_p = \omega_p(p_c - p)$, $\nu_q = \omega_q(q_c - q)$,
+$\nu_r = \omega_r(r_c - r)$, solve each axis for the moment the surfaces must produce:
+\begin{align}
+  \mathcal L_c &= I_{xx}\,\nu_p - (I_{yy}-I_{zz})\,q r - \mathcal L_0, \\
+  \mathcal M_c &= I_{yy}\,\nu_q - (I_{zz}-I_{xx})\,p r - \mathcal M_0, \\
+  \mathcal N_c &= I_{zz}\,\nu_r - (I_{xx}-I_{yy})\,p q - \mathcal N_0 .
+\end{align}
+
+\paragraph{Control allocation.} The surfaces must satisfy
+\begin{equation}
+  \bar q S\begin{bmatrix} b\,C_{l,\vb\delta}\\ \bar c\,C_{m,\vb\delta}\\ b\,C_{n,\vb\delta}\end{bmatrix}\vb\delta
+  \equiv B_\delta\,\vb\delta
+  = \begin{bmatrix}\mathcal L_c\\ \mathcal M_c\\ \mathcal N_c\end{bmatrix}.
+\end{equation}
+With exactly three independent effectors, $\vb\delta = B_\delta^{-1}[\mathcal L_c,\mathcal M_c,\mathcal N_c]^T$.
+With more than three, use a weighted pseudo-inverse,
+$\vb\delta = W^{-1}B_\delta^T\left(B_\delta W^{-1}B_\delta^T\right)^{-1}[\mathcal L_c,\mathcal M_c,\mathcal N_c]^T$,
+then clip to deflection limits (or use a constrained allocator).
+
+\subsection{Incremental NDI (INDI)}
+
+NDI needs accurate $\mathcal L_0$, $\mathcal M_0$, $\mathcal N_0$. INDI avoids most of that
+model. Write the rate dynamics as $\dot{\vb\omega} = \vb f_\omega(\vb x) + G_\omega\vb\delta$
+with $G_\omega = \mathrm{diag}(I_{xx},I_{yy},I_{zz})^{-1}B_\delta$. At the previous sample,
+the measured angular acceleration is $\dot{\vb\omega}_0 = \vb f_\omega(\vb x_0) + G_\omega\vb\delta_0$.
+Subtracting, and assuming $\vb f_\omega$ changes little over one sample:
+\begin{equation}
+  \dot{\vb\omega} - \dot{\vb\omega}_0 \approx G_\omega\left(\vb\delta - \vb\delta_0\right)
+  \quad\Rightarrow\quad
+  \vb\delta = \vb\delta_0 + G_\omega^{-1}\left(\vb\nu_\omega - \dot{\vb\omega}_0\right).
+\end{equation}
+Only the control effectiveness $G_\omega$ is needed. The costs are an angular acceleration
+estimate (filtered differentiation of the rate gyros), knowledge of the actual actuator
+positions $\vb\delta_0$, and matched filtering of the two.
+
+\subsection{Practical points}
+
+\begin{itemize}
+\item \textbf{Bandwidth separation:} $\omega_p,\omega_q,\omega_r$ about 3--5 times
+  $\omega_\alpha,\omega_\beta,\omega_\mu$, which are about 3--5 times the guidance
+  bandwidth. Actuators faster still.
+\item \textbf{Saturation:} when surfaces saturate the inversion is no longer exact; use
+  anti-windup on integrators and consider pseudo-control hedging.
+\item \textbf{Verification:} NDI's nominal loop is an integrator ($\nu/s$), which looks
+  perfectly robust. Real margins come from actuator dynamics, delays and model error, so
+  linearize the closed loop with those included, break it at the actuators, and check
+  margins exactly as for the classical design. Repeat with perturbed control effectiveness and
+  moment coefficients.
+\end{itemize}
+
+\section{Comparison}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.2\textwidth}>{\raggedright\arraybackslash}p{0.24\textwidth}>{\raggedright\arraybackslash}p{0.24\textwidth}>{\raggedright\arraybackslash}p{0.24\textwidth}@{}}
+\toprule
+& Classical, gain-scheduled & NDI & INDI \\
+\midrule
+Model needed & linear models at design points & full moment model and effectiveness & effectiveness only \\
+Scheduling & explicit gain tables & built in & built in \\
+Sensitivity to aero error & moderate (margins) & high & low \\
+Extra sensors & none & none & angular acceleration, actuator positions \\
+Certification history & long (Shuttle, most aircraft) & established (X-38, modern fighters) & growing (research, eVTOL) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%======================================================================
+\appendix
+\chapter{Verification record}\label{app:verify}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.36\textwidth}>{\raggedright\arraybackslash}p{0.6\textwidth}@{}}
+\toprule
+Item & How it was checked \\
+\midrule
+Local basis derivatives, $\vb\omega_{LE}$, kinematics, transport terms (\cref{ch:eom}) &
+  Symbolic (sympy): every intermediate expression reduces to zero difference. \\
+Force projections and assembled equations \cref{eq:full_r}--\cref{eq:full_psi} &
+  Symbolic: derived from \cref{eq:rotating} and compared with the expressions in
+  \code{hl20\_model.py}: identical. \\
+$J_2$ gravity \cref{eq:gravity} & Numerical against \code{hgv3.gravity\_vector} at 50 random
+  points: relative error below $10^{-15}$. \\
+Model against simulator & Open-loop $(\alpha,\sigma)$ from Mach 15 for 800 s at three bank
+  settings: altitude within 10 m, speed within 0.1 m/s, along-track drift 0.8 m/s. \\
+Partial derivatives (\cref{ch:lin}) & All 34 hand expressions against symbolic
+  differentiation with generic $C_L$, $C_D$, $\rho$, $a_s$: relative error below
+  $10^{-14}$; all entries listed as zero confirmed zero. \\
+Simplification error (\cref{sec:simplify}) & CasADi Jacobians of the full and simplified
+  model along a planned trajectory. \\
+Error-state model \cref{eq:errmodel} & Symbolic Jacobian of the nonlinear error dynamics with
+  generic $f_V$, $f_\gamma$, $f_\psi$: matches entry by entry; error rates vanish at zero
+  error. \\
+CasADi snippet (\cref{sec:casadi}) & Run against \code{hl20\_model.py} on a planned
+  trajectory. \\
+Euler equations with $I_{xz}$ & Symbolic: identical to $I\dot{\vb\omega}+\vb\omega\times I\vb\omega=\vb M$. \\
+Wind-axis kinematics \cref{eq:alphadot}--\cref{eq:mudot} and $\dot\gamma$, $\dot\chi$ &
+  Numerical against a rigid-body model (finite difference of angles extracted from the
+  attitude matrix and velocity) at 200 random states with sideslip and side force: agreement
+  to $10^{-10}$. \\
+$G_s^{-1}$ and the wings-level linearizations & Symbolic. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
